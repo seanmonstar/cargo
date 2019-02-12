@@ -874,9 +874,10 @@ impl Execs {
         match self.expect_exit_code {
             None => Ok(()),
             Some(code) if actual.status.code() == Some(code) => Ok(()),
-            Some(_) => Err(format!(
-                "exited with {}\n--- stdout\n{}\n--- stderr\n{}",
+            Some(expected) => Err(format!(
+                "exited with {} (expected {})\n--- stdout\n{}\n--- stderr\n{}",
                 actual.status,
+                expected,
                 String::from_utf8_lossy(&actual.stdout),
                 String::from_utf8_lossy(&actual.stderr)
             )),

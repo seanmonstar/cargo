@@ -5,9 +5,9 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use curl::easy::{Easy, List};
 use git2::{self, ObjectType};
 use log::{debug, info};
+use reqwest::Client;
 use serde::ser;
 use serde::Serialize;
 use url::Url;
@@ -681,9 +681,9 @@ pub fn fetch(
     // testing if we've already got an up-to-date copy of the repository
     if url.host_str() == Some("github.com") {
         if let Ok(oid) = repo.refname_to_id("refs/remotes/origin/master") {
-            let mut handle = config.http()?.borrow_mut();
+            let client = config.http()?;
             debug!("attempting GitHub fast path for {}", url);
-            if github_up_to_date(&mut handle, url, &oid) {
+            if github_up_to_date(client, url, &oid) {
                 return Ok(());
             } else {
                 debug!("fast path failed, falling back to a git fetch");
@@ -882,7 +882,7 @@ fn init(path: &Path, bare: bool) -> CargoResult<git2::Repository> {
 /// just a fast path. As a result all errors are ignored in this function and we
 /// just return a `bool`. Any real errors will be reported through the normal
 /// update path above.
-fn github_up_to_date(handle: &mut Easy, url: &Url, oid: &git2::Oid) -> bool {
+fn github_up_to_date(client: &Client, url: &Url, oid: &git2::Oid) -> bool {
     macro_rules! r#try {
         ($e:expr) => {
             match $e {
@@ -905,14 +905,11 @@ fn github_up_to_date(handle: &mut Easy, url: &Url, oid: &git2::Oid) -> bool {
         "https://api.github.com/repos/{}/{}/commits/master",
         username, repo
     );
-    r#try!(handle.get(true).ok());
-    r#try!(handle.url(&url).ok());
-    r#try!(handle.useragent("cargo").ok());
-    let mut headers = List::new();
-    r#try!(headers.append("Accept: application/vnd.github.3.sha").ok());
-    r#try!(headers.append(&format!("If-None-Match: \"{}\"", oid)).ok());
-    r#try!(handle.http_headers(headers).ok());
-    r#try!(handle.perform().ok());
-
-    r#try!(handle.response_code().ok()) == 304
+    client.get(&url)
+        .header("user-agent", "cargo")
+        .header("accept", "application/vnd.github.3.sha")
+        .header("if-none-match", oid.to_string())
+        .send()
+        .map(|res| res.status() == 304)
+        .unwrap_or(false)
 }

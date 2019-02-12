@@ -3,19 +3,21 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash;
+use std::io;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bytesize::ByteSize;
-use curl::easy::{Easy, HttpVersion};
-use curl::multi::{EasyHandle, Multi};
-use failure::ResultExt;
+use futures::stream::futures_unordered::FuturesUnordered;
+use futures::{future, Future, Stream};
 use lazycell::LazyCell;
-use log::{debug, warn};
+use log::{debug, trace};
+use reqwest::r#async::Client;
 use semver::Version;
 use serde::ser;
 use serde::Serialize;
+use tokio::runtime::current_thread::Runtime;
 
 use crate::core::interning::InternedString;
 use crate::core::source::MaybePackage;
@@ -266,16 +268,18 @@ pub struct PackageSet<'cfg> {
     packages: HashMap<PackageId, LazyCell<Package>>,
     sources: RefCell<SourceMap<'cfg>>,
     config: &'cfg Config,
-    multi: Multi,
+    client: Client,
+    runtime: RefCell<Runtime>,
     downloading: Cell<bool>,
-    multiplexing: bool,
 }
+
+type Pending = Box<dyn Future<Item = (usize, Result<(), NetworkError>), Error = ()>>;
 
 pub struct Downloads<'a, 'cfg: 'a> {
     set: &'a PackageSet<'cfg>,
-    pending: HashMap<usize, (Download<'cfg>, EasyHandle)>,
+    pending_downloads: HashMap<usize, Download<'cfg>>,
+    pending_futures: RefCell<FuturesUnordered<Pending>>,
     pending_ids: HashSet<PackageId>,
-    results: Vec<(usize, Result<(), curl::Error>)>,
     next: usize,
     progress: RefCell<Option<Progress<'cfg>>>,
     downloads_finished: usize,
@@ -283,6 +287,8 @@ pub struct Downloads<'a, 'cfg: 'a> {
     largest: (u64, String),
     start: Instant,
     success: bool,
+
+    http_debug: bool,
 
     /// Timeout management, both of timeout thresholds as well as whether or not
     /// our connection has timed out (and accompanying message if it has).
@@ -304,12 +310,15 @@ struct Download<'cfg> {
     /// Package that we're downloading
     id: PackageId,
 
+    /// HTTP status of last download request
+    status: Cell<Option<reqwest::StatusCode>>,
+
     /// Actual downloaded data, updated throughout the lifetime of this download
     data: RefCell<Vec<u8>>,
 
     /// The URL that we're downloading from, cached here for error messages and
     /// reenqueuing.
-    url: String,
+    url: RefCell<String>,
 
     /// A descriptive string to print when we've finished downloading this crate
     descriptor: String,
@@ -332,26 +341,6 @@ impl<'cfg> PackageSet<'cfg> {
         sources: SourceMap<'cfg>,
         config: &'cfg Config,
     ) -> CargoResult<PackageSet<'cfg>> {
-        // We've enabled the `http2` feature of `curl` in Cargo, so treat
-        // failures here as fatal as it would indicate a build-time problem.
-        //
-        // Note that the multiplexing support is pretty new so we're having it
-        // off-by-default temporarily.
-        //
-        // Also note that pipelining is disabled as curl authors have indicated
-        // that it's buggy, and we've empirically seen that it's buggy with HTTP
-        // proxies.
-        let mut multi = Multi::new();
-        let multiplexing = config
-            .get::<Option<bool>>("http.multiplexing")?
-            .unwrap_or(true);
-        multi
-            .pipelining(false, multiplexing)
-            .chain_err(|| "failed to enable multiplexing/pipelining in curl")?;
-
-        // let's not flood crates.io with connections
-        multi.set_max_host_connections(2)?;
-
         Ok(PackageSet {
             packages: package_ids
                 .iter()
@@ -359,9 +348,9 @@ impl<'cfg> PackageSet<'cfg> {
                 .collect(),
             sources: RefCell::new(sources),
             config,
-            multi,
+            client: Client::new(),
+            runtime: RefCell::new(Runtime::new()?),
             downloading: Cell::new(false),
-            multiplexing,
         })
     }
 
@@ -372,13 +361,19 @@ impl<'cfg> PackageSet<'cfg> {
     pub fn enable_download<'a>(&'a self) -> CargoResult<Downloads<'a, 'cfg>> {
         assert!(!self.downloading.replace(true));
         let timeout = ops::HttpTimeout::new(self.config)?;
+
+        let http_debug = self.config
+            .get::<Option<bool>>("http.debug")
+            .unwrap_or(None)
+            .unwrap_or(false);
+
         Ok(Downloads {
             start: Instant::now(),
             set: self,
             next: 0,
-            pending: HashMap::new(),
+            pending_downloads: HashMap::new(),
+            pending_futures: RefCell::new(FuturesUnordered::new()),
             pending_ids: HashSet::new(),
-            results: Vec::new(),
             progress: RefCell::new(Some(Progress::with_style(
                 "Downloading",
                 ProgressStyle::Ratio,
@@ -386,6 +381,7 @@ impl<'cfg> PackageSet<'cfg> {
             ))),
             downloads_finished: 0,
             downloaded_bytes: 0,
+            http_debug,
             largest: (0, String::new()),
             success: false,
             updated_at: Cell::new(Instant::now()),
@@ -415,23 +411,6 @@ impl<'cfg> PackageSet<'cfg> {
     pub fn sources(&self) -> Ref<'_, SourceMap<'cfg>> {
         self.sources.borrow()
     }
-}
-
-// When dynamically linked against libcurl, we want to ignore some failures
-// when using old versions that don't support certain features.
-macro_rules! try_old_curl {
-    ($e:expr, $msg:expr) => {
-        let result = $e;
-        if cfg!(target_os = "macos") {
-            if let Err(e) = result {
-                warn!("ignoring libcurl {} error: {}", $msg, e);
-            }
-        } else {
-            result.with_context(|_| {
-                failure::format_err!("failed to enable {}, is curl not built right?", $msg)
-            })?;
-        }
-    };
 }
 
 impl<'a, 'cfg> Downloads<'a, 'cfg> {
@@ -480,65 +459,11 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         debug!("downloading {} as {}", id, token);
         assert!(self.pending_ids.insert(id));
 
-        let (mut handle, _timeout) = ops::http_handle_and_timeout(self.set.config)?;
-        handle.get(true)?;
-        handle.url(&url)?;
-        handle.follow_location(true)?; // follow redirects
-
-        // Enable HTTP/2 to be used as it'll allow true multiplexing which makes
-        // downloads much faster.
-        //
-        // Currently Cargo requests the `http2` feature of the `curl` crate
-        // which means it should always be built in. On OSX, however, we ship
-        // cargo still linked against the system libcurl. Building curl with
-        // ALPN support for HTTP/2 requires newer versions of OSX (the
-        // SecureTransport API) than we want to ship Cargo for. By linking Cargo
-        // against the system libcurl then older curl installations won't use
-        // HTTP/2 but newer ones will. All that to basically say we ignore
-        // errors here on OSX, but consider this a fatal error to not activate
-        // HTTP/2 on all other platforms.
-        if self.set.multiplexing {
-            try_old_curl!(handle.http_version(HttpVersion::V2), "HTTP2");
-        } else {
-            handle.http_version(HttpVersion::V11)?;
-        }
-
-        // This is an option to `libcurl` which indicates that if there's a
-        // bunch of parallel requests to the same host they all wait until the
-        // pipelining status of the host is known. This means that we won't
-        // initiate dozens of connections to crates.io, but rather only one.
-        // Once the main one is opened we realized that pipelining is possible
-        // and multiplexing is possible with static.crates.io. All in all this
-        // reduces the number of connections done to a more manageable state.
-        try_old_curl!(handle.pipewait(true), "pipewait");
-
-        handle.write_function(move |buf| {
-            debug!("{} - {} bytes of data", token, buf.len());
-            tls::with(|downloads| {
-                if let Some(downloads) = downloads {
-                    downloads.pending[&token]
-                        .0
-                        .data
-                        .borrow_mut()
-                        .extend_from_slice(buf);
-                }
-            });
-            Ok(buf.len())
-        })?;
-
-        handle.progress(true)?;
-        handle.progress_function(move |dl_total, dl_cur, _, _| {
-            tls::with(|downloads| match downloads {
-                Some(d) => d.progress(token, dl_total as u64, dl_cur as u64),
-                None => false,
-            })
-        })?;
-
         // If the progress bar isn't enabled then it may be awhile before the
         // first crate finishes downloading so we inform immediately that we're
         // downloading crates here.
         if self.downloads_finished == 0
-            && self.pending.is_empty()
+            && self.pending_downloads.is_empty()
             && !self.progress.borrow().as_ref().unwrap().is_enabled()
         {
             self.set
@@ -551,15 +476,16 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
             token,
             data: RefCell::new(Vec::new()),
             id,
-            url,
+            url: RefCell::new(url),
             descriptor,
+            status: Cell::new(None),
             total: Cell::new(0),
             current: Cell::new(0),
             start: Instant::now(),
             timed_out: Cell::new(None),
             retry: Retry::new(self.set.config)?,
         };
-        self.enqueue(dl, handle)?;
+        self.enqueue(dl);
         self.tick(WhyTick::DownloadStarted)?;
 
         Ok(None)
@@ -567,7 +493,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
 
     /// Returns the number of crates that are still downloading
     pub fn remaining(&self) -> usize {
-        self.pending.len()
+        self.pending_downloads.len()
     }
 
     /// Blocks the current thread waiting for a package to finish downloading.
@@ -580,16 +506,15 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
     /// This function will panic if there are no remaining downloads.
     pub fn wait(&mut self) -> CargoResult<&'a Package> {
         let (dl, data) = loop {
-            assert_eq!(self.pending.len(), self.pending_ids.len());
-            let (token, result) = self.wait_for_curl()?;
+            assert_eq!(self.pending_downloads.len(), self.pending_ids.len());
+            let (token, result) = self.wait_for_network()?;
             debug!("{} finished with {:?}", token, result);
 
-            let (mut dl, handle) = self
-                .pending
+            let mut dl = self
+                .pending_downloads
                 .remove(&token)
                 .expect("got a token for a non-in-progress transfer");
             let data = mem::replace(&mut *dl.data.borrow_mut(), Vec::new());
-            let mut handle = self.set.multi.remove(handle)?;
             self.pending_ids.remove(&dl.id);
 
             // Check if this was a spurious error. If it was a spurious error
@@ -597,51 +522,51 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
             // then we wait for another request to finish.
             let ret = {
                 let timed_out = &dl.timed_out;
-                let url = &dl.url;
+                let url = dl.url.borrow();
+                let status_code = dl.status.replace(None);
                 dl.retry
                     .r#try(|| {
-                        if let Err(e) = result {
-                            // If this error is "aborted by callback" then that's
-                            // probably because our progress callback aborted due to
-                            // a timeout. We'll find out by looking at the
-                            // `timed_out` field, looking for a descriptive message.
-                            // If one is found we switch the error code (to ensure
-                            // it's flagged as spurious) and then attach our extra
-                            // information to the error.
-                            if !e.is_aborted_by_callback() {
-                                return Err(e.into());
-                            }
+                        match result {
+                            Ok(()) => (),
+                            Err(NetworkError::Reqwest(err)) => {
+                                return Err(err.into());
+                            },
+                            Err(NetworkError::Progress) => {
+                                return Err(match timed_out.replace(None) {
+                                    Some(msg) => {
+                                        io::Error::new(
+                                            io::ErrorKind::TimedOut,
+                                            msg,
+                                        ).into()
+                                    },
+                                    None => {
+                                        failure::format_err!("progress bar print error")
+                                    },
+                                });
+                            },
+                        };
 
-                            return Err(match timed_out.replace(None) {
-                                Some(msg) => {
-                                    let code = curl_sys::CURLE_OPERATION_TIMEDOUT;
-                                    let mut err = curl::Error::new(code);
-                                    err.set_extra(msg);
-                                    err
+                        match status_code {
+                            Some(reqwest::StatusCode::OK) |
+                            None => {
+                                Ok(())
+                            },
+                            Some(other_code) => {
+                                Err(HttpNot200 {
+                                    code: other_code.as_u16().into(),
+                                    url: url.to_string(),
                                 }
-                                None => e,
+                                .into())
                             }
-                            .into());
                         }
-
-                        let code = handle.response_code()?;
-                        if code != 200 && code != 0 {
-                            let url = handle.effective_url()?.unwrap_or(url);
-                            return Err(HttpNot200 {
-                                code,
-                                url: url.to_string(),
-                            }
-                            .into());
-                        }
-                        Ok(())
                     })
-                    .chain_err(|| format!("failed to download from `{}`", dl.url))?
+                    .chain_err(|| format!("failed to download from `{}`", url))?
             };
             match ret {
                 Some(()) => break (dl, data),
                 None => {
                     self.pending_ids.insert(dl.id);
-                    self.enqueue(dl, handle)?
+                    self.enqueue(dl);
                 }
             }
         };
@@ -695,10 +620,8 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         Ok(slot.borrow().unwrap())
     }
 
-    fn enqueue(&mut self, dl: Download<'cfg>, handle: Easy) -> CargoResult<()> {
-        let mut handle = self.set.multi.add(handle)?;
+    fn enqueue(&mut self, dl: Download<'cfg>) {
         let now = Instant::now();
-        handle.set_token(dl.token)?;
         self.updated_at.set(now);
         self.next_speed_check.set(now + self.timeout.dur);
         self.next_speed_check_bytes_threshold
@@ -706,64 +629,117 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         dl.timed_out.set(None);
         dl.current.set(0);
         dl.total.set(0);
-        self.pending.insert(dl.token, (dl, handle));
-        Ok(())
-    }
+        let token = dl.token;
+        let http_debug = self.http_debug;
 
-    fn wait_for_curl(&mut self) -> CargoResult<(usize, Result<(), curl::Error>)> {
-        // This is the main workhorse loop. We use libcurl's portable `wait`
-        // method to actually perform blocking. This isn't necessarily too
-        // efficient in terms of fd management, but we should only be juggling
-        // a few anyway.
-        //
-        // Here we start off by asking the `multi` handle to do some work via
-        // the `perform` method. This will actually do I/O work (nonblocking)
-        // and attempt to make progress. Afterwards we ask about the `messages`
-        // contained in the handle which will inform us if anything has finished
-        // transferring.
-        //
-        // If we've got a finished transfer after all that work we break out
-        // and process the finished transfer at the end. Otherwise we need to
-        // actually block waiting for I/O to happen, which we achieve with the
-        // `wait` method on `multi`.
-        loop {
-            let n = tls::set(self, || {
-                self.set
-                    .multi
-                    .perform()
-                    .chain_err(|| "failed to perform http requests")
-            })?;
-            debug!("handles remaining: {}", n);
-            let results = &mut self.results;
-            let pending = &self.pending;
-            self.set.multi.messages(|msg| {
-                let token = msg.token().expect("failed to read token");
-                let handle = &pending[&token].1;
-                if let Some(result) = msg.result_for(&handle) {
-                    results.push((token, result));
-                } else {
-                    debug!("message without a result (?)");
+
+        // reqwest doesn't handle file:// URLs, so do that manually...
+        if dl.url.borrow().starts_with("file://") {
+            let path = dl.url.borrow()["file://".len()..].to_owned();
+            let fut = future::lazy(move || {
+                match ::std::fs::read(path) {
+                    Ok(buf) => {
+                        tls::with(|downloads| {
+                            if let Some(downloads) = downloads {
+                                let dl_cur = {
+                                    let mut data = downloads
+                                        .pending_downloads[&token]
+                                        .data
+                                        .borrow_mut();
+                                    *data = buf;
+                                    data.len() as u64
+                                };
+
+                                // progress errors don't matter much here,
+                                // since we've already loaded the full file...
+                                let _ = downloads.progress(token, dl_cur, dl_cur);
+                            }
+                        });
+                        Ok((token, Ok(())))
+                    },
+                    Err(err) => unimplemented!("download file:// error: {}", err),
                 }
             });
 
-            if let Some(pair) = results.pop() {
-                break Ok(pair);
-            }
-            assert!(!self.pending.is_empty());
-            let timeout = self
-                .set
-                .multi
-                .get_timeout()?
-                .unwrap_or_else(|| Duration::new(5, 0));
-            self.set
-                .multi
-                .wait(&mut [], timeout)
-                .chain_err(|| "failed to wait on curl `Multi`")?;
+            self.pending_futures.get_mut().push(Box::new(fut));
+            self.pending_downloads.insert(token, dl);
+            return;
+        }
+
+        let fut = self
+            .set
+            .client
+            .get(&*dl.url.borrow())
+            .send()
+            .map_err(NetworkError::from)
+            .and_then(move |res| {
+                if http_debug {
+                    debug!("http-debug: < {:?}", res.headers());
+                }
+                let dl_total = res.content_length().unwrap_or(0);
+
+                tls::with(|downloads| {
+                    if let Some(downloads) = downloads {
+                        let dl = &downloads.pending_downloads[&token];
+                        dl.status.set(Some(res.status()));
+                        let mut dl_url = dl.url.borrow_mut();
+                        if res.url().as_str() != &**dl_url {
+                            *dl_url = res.url().to_string();
+                        }
+                    }
+                });
+
+                res.into_body().map_err(NetworkError::from).for_each(move |chunk| {
+                    debug!("{} - {} bytes of data", token, chunk.len());
+                    if http_debug {
+                        trace!("http-debug: }} {:?}", chunk);
+                    }
+                    tls::with(|downloads| {
+                        if let Some(downloads) = downloads {
+                            let dl_cur = {
+                                let mut data = downloads
+                                    .pending_downloads[&token]
+                                    .data
+                                    .borrow_mut();
+                                data.extend_from_slice(chunk.as_ref());
+                                data.len() as u64
+                            };
+
+                            downloads.progress(token, dl_total, dl_cur)?;
+                        }
+
+                        Ok(())
+                    })
+                })
+            })
+            .then(move |result| Ok((token, result)));
+
+        self.pending_futures.get_mut().push(Box::new(fut));
+        self.pending_downloads.insert(token, dl);
+    }
+
+    fn wait_for_network(&mut self) -> CargoResult<(usize, Result<(), NetworkError>)> {
+        let result = tls::set(self, || {
+            let mut pending_futures = self.pending_futures.borrow_mut();
+            let next = pending_futures
+                .by_ref()
+                .into_future()
+                .map(|(item, _)| item)
+                .map_err(|(err, _)| err);
+            self.set.runtime.borrow_mut().block_on(next)
+        });
+
+        match result {
+            Ok(Some(result)) => {
+                Ok(result)
+            },
+            Ok(None) => panic!("wait_for_network had no futures to wait for"),
+            Err(()) => unreachable!("pending errors are handled in Ok"),
         }
     }
 
-    fn progress(&self, token: usize, total: u64, cur: u64) -> bool {
-        let dl = &self.pending[&token].0;
+    fn progress(&self, token: usize, total: u64, cur: u64) -> Result<(), ProgressCanceled> {
+        let dl = &self.pending_downloads[&token];
         dl.total.set(total);
         let now = Instant::now();
         if cur != dl.current.get() {
@@ -782,7 +758,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
             }
         }
         if self.tick(WhyTick::DownloadUpdate).is_err() {
-            return false;
+            return Err(ProgressCanceled);
         }
 
         // If we've spent too long not actually receiving any data we time out.
@@ -794,7 +770,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
                 self.timeout.dur.as_secs()
             );
             dl.timed_out.set(Some(msg));
-            return false;
+            return Err(ProgressCanceled);
         }
 
         // If we reached the point in time that we need to check our speed
@@ -812,10 +788,10 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
                 self.timeout.dur.as_secs()
             );
             dl.timed_out.set(Some(msg));
-            return false;
+            return Err(ProgressCanceled);
         }
 
-        true
+        Ok(())
     }
 
     fn tick(&self, why: WhyTick<'_>) -> CargoResult<()> {
@@ -827,7 +803,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
                 return Ok(());
             }
         }
-        let pending = self.pending.len();
+        let pending = self.pending_downloads.len();
         let mut msg = if pending == 1 {
             format!("{} crate", pending)
         } else {
@@ -840,7 +816,7 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
             _ => {
                 let mut dur = Duration::new(0, 0);
                 let mut remaining = 0;
-                for (dl, _) in self.pending.values() {
+                for dl in self.pending_downloads.values() {
                     dur += dl.start.elapsed();
                     // If the total/current look weird just throw out the data
                     // point, sounds like curl has more to learn before we have
@@ -857,6 +833,27 @@ impl<'a, 'cfg> Downloads<'a, 'cfg> {
         progress.print_now(&msg)
     }
 }
+
+#[derive(Debug)]
+enum NetworkError {
+    Reqwest(reqwest::Error),
+    Progress,
+}
+
+impl From<reqwest::Error> for NetworkError {
+    fn from(err: reqwest::Error) -> Self {
+        NetworkError::Reqwest(err)
+    }
+}
+
+impl From<ProgressCanceled> for NetworkError {
+    fn from(_: ProgressCanceled) -> Self {
+        NetworkError::Progress
+    }
+}
+
+#[derive(Debug)]
+struct ProgressCanceled;
 
 #[derive(Copy, Clone)]
 enum WhyTick<'a> {

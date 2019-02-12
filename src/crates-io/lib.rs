@@ -3,16 +3,16 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::prelude::*;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 
-use curl::easy::{Easy, List};
 use failure::bail;
+use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use url::percent_encoding::{percent_encode, QUERY_ENCODE_SET};
 
 pub type Result<T> = std::result::Result<T, failure::Error>;
+pub type Tarball = Box<dyn Read + Send + 'static>;
 
 pub struct Registry {
     /// The base URL for issuing API requests.
@@ -20,8 +20,8 @@ pub struct Registry {
     /// Optional authorization token.
     /// If None, commands requiring authorization will fail.
     token: Option<String>,
-    /// Curl handle for issuing requests.
-    handle: Easy,
+    /// Reqwest client for issuing requests.
+    client: Client,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -125,14 +125,14 @@ struct Crates {
 }
 impl Registry {
     pub fn new(host: String, token: Option<String>) -> Registry {
-        Registry::new_handle(host, token, Easy::new())
+        Registry::new_handle(host, token, Client::new())
     }
 
-    pub fn new_handle(host: String, token: Option<String>, handle: Easy) -> Registry {
+    pub fn new_handle(host: String, token: Option<String>, client: Client) -> Registry {
         Registry {
             host,
             token,
-            handle,
+            client,
         }
     }
 
@@ -159,7 +159,7 @@ impl Registry {
         Ok(serde_json::from_str::<Users>(&body)?.users)
     }
 
-    pub fn publish(&mut self, krate: &NewCrate, tarball: &File) -> Result<Warnings> {
+    pub fn publish(&mut self, krate: &NewCrate, tarball: Tarball, tarball_size: u64) -> Result<Warnings> {
         let json = serde_json::to_string(krate)?;
         // Prepare the body. The format of the upload request is:
         //
@@ -167,7 +167,6 @@ impl Registry {
         //      <json request> (metadata for the package)
         //      <le u32 of tarball>
         //      <source tarball>
-        let stat = tarball.metadata()?;
         let header = {
             let mut w = Vec::new();
             w.extend(
@@ -181,38 +180,46 @@ impl Registry {
             w.extend(json.as_bytes().iter().cloned());
             w.extend(
                 [
-                    (stat.len() >> 0) as u8,
-                    (stat.len() >> 8) as u8,
-                    (stat.len() >> 16) as u8,
-                    (stat.len() >> 24) as u8,
+                    (tarball_size >> 0) as u8,
+                    (tarball_size >> 8) as u8,
+                    (tarball_size >> 16) as u8,
+                    (tarball_size >> 24) as u8,
                 ].iter().cloned(),
             );
             w
         };
-        let size = stat.len() as usize + header.len();
-        let mut body = Cursor::new(header).chain(tarball);
+        let size =  tarball_size + header.len() as u64;
+        let mut req_body = Cursor::new(header).chain(tarball);
 
         let url = format!("{}/api/v1/crates/new", self.host);
-
         let token = match self.token.as_ref() {
             Some(s) => s,
             None => bail!("no upload token found, please run `cargo login`"),
         };
-        self.handle.put(true)?;
-        self.handle.url(&url)?;
-        self.handle.in_filesize(size as u64)?;
-        let mut headers = List::new();
-        headers.append("Accept: application/json")?;
-        headers.append(&format!("Authorization: {}", token))?;
-        self.handle.http_headers(headers)?;
 
-        let body = handle(&mut self.handle, &mut |buf| body.read(buf).unwrap_or(0))?;
-
-        let response = if body.is_empty() {
+        let response = if url.starts_with("file://") {
+            // reqwest doesn't handle file:// URLs, so do it ourselves.
+            let mut file = File::create(&url["file://".len()..])?;
+            io::copy(&mut req_body, &mut file)?;
             "{}".parse()?
         } else {
-            body.parse::<serde_json::Value>()?
+            let req_body = reqwest::Body::sized(req_body, size as u64);
+
+            let req = self.client
+                .put(&url)
+                .header("accept", "application/json")
+                .header("authorization", &**token)
+                .body(req_body);
+
+            let res_body = send(req)?;
+
+            if res_body.is_empty() {
+                "{}".parse()?
+            } else {
+                res_body.parse::<serde_json::Value>()?
+            }
         };
+
 
         let invalid_categories: Vec<String> = response
             .get("warnings")
@@ -245,6 +252,7 @@ impl Registry {
     pub fn search(&mut self, query: &str, limit: u32) -> Result<(Vec<Crate>, u32)> {
         let formatted_query = percent_encode(query.as_bytes(), QUERY_ENCODE_SET);
         let body = self.req(
+            Method::GET,
             &format!("/crates?q={}&per_page={}", formatted_query, limit),
             None,
             Auth::Unauthorized,
@@ -267,83 +275,65 @@ impl Registry {
     }
 
     fn put(&mut self, path: &str, b: &[u8]) -> Result<String> {
-        self.handle.put(true)?;
-        self.req(path, Some(b), Auth::Authorized)
+        self.req(Method::PUT, path, Some(b), Auth::Authorized)
     }
 
     fn get(&mut self, path: &str) -> Result<String> {
-        self.handle.get(true)?;
-        self.req(path, None, Auth::Authorized)
+        self.req(Method::GET, path, None, Auth::Authorized)
     }
 
     fn delete(&mut self, path: &str, b: Option<&[u8]>) -> Result<String> {
-        self.handle.custom_request("DELETE")?;
-        self.req(path, b, Auth::Authorized)
+        self.req(Method::DELETE, path, b, Auth::Authorized)
     }
 
-    fn req(&mut self, path: &str, body: Option<&[u8]>, authorized: Auth) -> Result<String> {
-        self.handle.url(&format!("{}/api/v1{}", self.host, path))?;
-        let mut headers = List::new();
-        headers.append("Accept: application/json")?;
-        headers.append("Content-Type: application/json")?;
+    fn req(&mut self, method: Method, path: &str, body: Option<&[u8]>, authorized: Auth) -> Result<String> {
+        let mut req = self.client
+            .request(method, &format!("{}/api/v1{}", self.host, path))
+            .header("accept", "application/json")
+            .header("content-type", "application/json");
 
         if authorized == Auth::Authorized {
             let token = match self.token.as_ref() {
                 Some(s) => s,
                 None => bail!("no upload token found, please run `cargo login`"),
             };
-            headers.append(&format!("Authorization: {}", token))?;
+            req = req.header("authorization", &**token);
         }
-        self.handle.http_headers(headers)?;
+
         match body {
-            Some(mut body) => {
-                self.handle.upload(true)?;
-                self.handle.in_filesize(body.len() as u64)?;
-                handle(&mut self.handle, &mut |buf| body.read(buf).unwrap_or(0))
+            Some(body) => {
+                send(req.body(body.to_vec()))
             }
-            None => handle(&mut self.handle, &mut |_| 0),
+            None => send(req)
         }
     }
 }
 
-fn handle(handle: &mut Easy, read: &mut dyn FnMut(&mut [u8]) -> usize) -> Result<String> {
-    let mut headers = Vec::new();
-    let mut body = Vec::new();
-    {
-        let mut handle = handle.transfer();
-        handle.read_function(|buf| Ok(read(buf)))?;
-        handle.write_function(|data| {
-            body.extend_from_slice(data);
-            Ok(data.len())
-        })?;
-        handle.header_function(|data| {
-            headers.push(String::from_utf8_lossy(data).into_owned());
-            true
-        })?;
-        handle.perform()?;
-    }
+fn send(req: RequestBuilder) -> Result<String> {
 
-    match handle.response_code()? {
-        0 => {} // file upload url sometimes
-        200 => {}
-        403 => bail!("received 403 unauthorized response code"),
-        404 => bail!("received 404 not found response code"),
-        code => bail!(
-            "failed to get a 200 OK response, got {}\n\
-             headers:\n\
-             \t{}\n\
-             body:\n\
-             {}",
-            code,
-            headers.join("\n\t"),
-            String::from_utf8_lossy(&body)
-        ),
-    }
+    let mut res = req.send()?;
 
-    let body = match String::from_utf8(body) {
+    let body = match res.text() {
         Ok(body) => body,
         Err(..) => bail!("response body was not valid utf-8"),
     };
+
+    match res.status() {
+        StatusCode::OK => {}
+        StatusCode::UNAUTHORIZED => bail!("received 403 unauthorized response code"),
+        StatusCode::NOT_FOUND => bail!("received 404 not found response code"),
+        code => bail!(
+            "failed to get a 200 OK response, got {}\n\
+             headers:\n\
+             \t{:#?}\n\
+             body:\n\
+             {}",
+            code,
+            res.headers(),
+            body
+        ),
+    }
+
     if let Ok(errors) = serde_json::from_str::<ApiErrorList>(&body) {
         let errors = errors.errors.into_iter().map(|s| s.detail);
         bail!("api errors: {}", errors.collect::<Vec<_>>().join(", "));

@@ -14,8 +14,8 @@ use std::sync::{Once, ONCE_INIT};
 use std::time::Instant;
 use std::vec;
 
-use curl::easy::Easy;
 use lazycell::LazyCell;
+use reqwest::Client;
 use serde::Deserialize;
 use serde::{de, de::IntoDeserializer};
 
@@ -61,8 +61,8 @@ pub struct Config {
     jobserver: Option<jobserver::Client>,
     /// Cli flags of the form "-Z something"
     cli_flags: CliUnstable,
-    /// A handle on curl easy mode for http calls
-    easy: LazyCell<RefCell<Easy>>,
+    /// A Reqwest Client handle for http calls
+    client: LazyCell<Client>,
     /// Cache of the `SourceId` for crates.io
     crates_io_source_id: LazyCell<SourceId>,
     /// If false, don't cache `rustc --version --verbose` invocations
@@ -123,7 +123,7 @@ impl Config {
                 }
             },
             cli_flags: CliUnstable::default(),
-            easy: LazyCell::new(),
+            client: LazyCell::new(),
             crates_io_source_id: LazyCell::new(),
             cache_rustc_info,
             creation_time: Instant::now(),
@@ -765,16 +765,18 @@ impl Config {
         self.jobserver.as_ref()
     }
 
-    pub fn http(&self) -> CargoResult<&RefCell<Easy>> {
+    pub fn http(&self) -> CargoResult<&Client> {
         let http = self
-            .easy
-            .try_borrow_with(|| ops::http_handle(self).map(RefCell::new))?;
+            .client
+            .try_borrow_with(|| ops::http_handle(self))?;
+        /*
         {
             let mut http = http.borrow_mut();
             http.reset();
             let timeout = ops::configure_http_handle(self, &mut http)?;
             timeout.configure(&mut http)?;
         }
+        */
         Ok(http)
     }
 

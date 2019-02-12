@@ -1,6 +1,6 @@
-use curl;
-use git2;
+use std::io;
 
+use git2;
 use failure::Error;
 
 use crate::util::errors::{CargoResult, HttpNot200};
@@ -44,6 +44,7 @@ fn maybe_spurious(err: &Error) -> bool {
                 _ => (),
             }
         }
+        /*
         if let Some(curl_err) = e.downcast_ref::<curl::Error>() {
             if curl_err.is_couldnt_connect()
                 || curl_err.is_couldnt_resolve_proxy()
@@ -51,6 +52,12 @@ fn maybe_spurious(err: &Error) -> bool {
                 || curl_err.is_operation_timedout()
                 || curl_err.is_recv_error()
             {
+                return true;
+            }
+        }
+        */
+        if let Some(io_err) = e.downcast_ref::<io::Error>() {
+            if io_err.kind() == io::ErrorKind::TimedOut {
                 return true;
             }
         }

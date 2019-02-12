@@ -209,7 +209,9 @@ fn init_git_transports(config: &Config) {
     // binary (we know what the state of the world looks like) and we're mostly
     // clear on point (2) because we'd only free it after everything is done
     // anyway
+    /*
     unsafe {
         git2_curl::register(handle);
     }
+    */
 }

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufRead};
 use std::iter::repeat;
 use std::str;
@@ -7,8 +7,7 @@ use std::time::Duration;
 use std::{cmp, env};
 
 use crates_io::{NewCrate, NewCrateDependency, Registry};
-use curl::easy::{Easy, InfoType, SslOpt};
-use log::{log, Level};
+use reqwest::{Client, ClientBuilder};
 use url::percent_encoding::{percent_encode, QUERY_ENCODE_SET};
 
 use crate::core::dependency::Kind;
@@ -21,7 +20,7 @@ use crate::util::config::{self, Config};
 use crate::util::errors::{CargoResult, CargoResultExt};
 use crate::util::important_paths::find_root_manifest_for_wd;
 use crate::util::ToUrl;
-use crate::util::{paths, validate_package_name};
+use crate::util::{FileLock, paths, validate_package_name};
 use crate::version;
 
 pub struct RegistryConfig {
@@ -95,7 +94,7 @@ pub fn publish(ws: &Workspace<'_>, opts: &PublishOpts<'_>) -> CargoResult<()> {
     transmit(
         opts.config,
         pkg,
-        tarball.file(),
+        tarball,
         &mut registry,
         reg_id,
         opts.dry_run,
@@ -159,7 +158,7 @@ fn verify_dependencies(
 fn transmit(
     config: &Config,
     pkg: &Package,
-    tarball: &File,
+    tarball: FileLock,
     registry: &mut Registry,
     registry_id: SourceId,
     dry_run: bool,
@@ -243,6 +242,8 @@ fn transmit(
         })
         .collect::<BTreeMap<String, Vec<String>>>();
 
+    let tarball_size = tarball.file().metadata()?.len();
+
     let publish = registry.publish(
         &NewCrate {
             name: pkg.name().to_string(),
@@ -263,7 +264,8 @@ fn transmit(
             badges: badges.clone(),
             links: links.clone(),
         },
-        tarball,
+        Box::new(tarball),
+        tarball_size
     );
 
     match publish {
@@ -364,13 +366,13 @@ pub fn registry(
 }
 
 /// Create a new HTTP handle with appropriate global configuration for cargo.
-pub fn http_handle(config: &Config) -> CargoResult<Easy> {
-    let (mut handle, timeout) = http_handle_and_timeout(config)?;
-    timeout.configure(&mut handle)?;
+pub fn http_handle(config: &Config) -> CargoResult<Client> {
+    let (handle, _timeout) = http_handle_and_timeout(config)?;
+    //timeout.configure(&mut handle)?;
     Ok(handle)
 }
 
-pub fn http_handle_and_timeout(config: &Config) -> CargoResult<(Easy, HttpTimeout)> {
+pub fn http_handle_and_timeout(config: &Config) -> CargoResult<(Client, HttpTimeout)> {
     if config.frozen() {
         failure::bail!(
             "attempting to make an HTTP request, but --frozen was \
@@ -385,9 +387,8 @@ pub fn http_handle_and_timeout(config: &Config) -> CargoResult<(Easy, HttpTimeou
     // but we probably don't want this. Instead we only set timeouts for the
     // connect phase as well as a "low speed" timeout so if we don't receive
     // many bytes in a large-ish period of time then we time out.
-    let mut handle = Easy::new();
-    let timeout = configure_http_handle(config, &mut handle)?;
-    Ok((handle, timeout))
+    let builder = Client::builder();
+    configure_http_handle(config, builder)
 }
 
 pub fn needs_custom_http_transport(config: &Config) -> CargoResult<bool> {
@@ -405,7 +406,8 @@ pub fn needs_custom_http_transport(config: &Config) -> CargoResult<bool> {
 }
 
 /// Configure a libcurl http handle with the defaults options for Cargo
-pub fn configure_http_handle(config: &Config, handle: &mut Easy) -> CargoResult<HttpTimeout> {
+pub fn configure_http_handle(config: &Config, builder: ClientBuilder) -> CargoResult<(Client, HttpTimeout)> {
+    /*
     if let Some(proxy) = http_proxy(config)? {
         handle.proxy(&proxy)?;
     }
@@ -415,43 +417,23 @@ pub fn configure_http_handle(config: &Config, handle: &mut Easy) -> CargoResult<
     if let Some(check) = config.get_bool("http.check-revoke")? {
         handle.ssl_options(SslOpt::new().no_revoke(!check.val))?;
     }
-    if let Some(user_agent) = config.get_string("http.user-agent")? {
-        handle.useragent(&user_agent.val)?;
+    */
+    let mut headers = reqwest::header::HeaderMap::new();
+    let ua = if let Some(user_agent) = config.get_string("http.user-agent")? {
+        user_agent.val.parse()?
     } else {
-        handle.useragent(&version().to_string())?;
-    }
+        version().to_string().parse()?
+    };
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        ua
+    );
 
-    if let Some(true) = config.get::<Option<bool>>("http.debug")? {
-        handle.verbose(true)?;
-        handle.debug_function(|kind, data| {
-            let (prefix, level) = match kind {
-                InfoType::Text => ("*", Level::Debug),
-                InfoType::HeaderIn => ("<", Level::Debug),
-                InfoType::HeaderOut => (">", Level::Debug),
-                InfoType::DataIn => ("{", Level::Trace),
-                InfoType::DataOut => ("}", Level::Trace),
-                InfoType::SslDataIn | InfoType::SslDataOut => return,
-                _ => return,
-            };
-            match str::from_utf8(data) {
-                Ok(s) => {
-                    for line in s.lines() {
-                        log!(level, "http-debug: {} {}", prefix, line);
-                    }
-                }
-                Err(_) => {
-                    log!(
-                        level,
-                        "http-debug: {} ({} bytes of data)",
-                        prefix,
-                        data.len()
-                    );
-                }
-            }
-        })?;
-    }
-
-    HttpTimeout::new(config)
+    let timeout = HttpTimeout::new(config)?;
+    let client = builder
+        .default_headers(headers)
+        .build()?;
+    Ok((client, timeout))
 }
 
 #[must_use]
@@ -479,6 +461,7 @@ impl HttpTimeout {
         self.dur != Duration::new(30, 0) || self.low_speed_limit != 10
     }
 
+    /*
     pub fn configure(&self, handle: &mut Easy) -> CargoResult<()> {
         // The timeout option for libcurl by default times out the entire
         // transfer, but we probably don't want this. Instead we only set
@@ -490,6 +473,7 @@ impl HttpTimeout {
         handle.low_speed_limit(self.low_speed_limit)?;
         Ok(())
     }
+    */
 }
 
 /// Find an explicit HTTP proxy if one is available.
